@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "units.h": "c",
+        "cutils.h": "c"
+    }
+}
