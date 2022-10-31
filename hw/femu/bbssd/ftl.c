@@ -815,7 +815,6 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     uint64_t curlat = 0, maxlat = 0;
     int r;
 
-    femu_log("write now\n");
     if (end_lpn >= spp->tt_pgs) {
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
@@ -888,6 +887,12 @@ static void *ftl_thread(void *arg)
 
             ftl_assert(req);
             switch (req->cmd.opcode) {
+            case NVME_CMD_T_BEGIN:
+            case NVME_CMD_T_ABORT:
+            case NVME_CMD_T_WRITE:
+            case NVME_CMD_T_COMMIT:
+                lat = 10000;
+                break;
             case NVME_CMD_WRITE:
                 lat = ssd_write(ssd, req);
                 break;

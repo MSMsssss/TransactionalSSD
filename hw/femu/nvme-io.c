@@ -492,6 +492,12 @@ static uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
     req->ns = ns = &n->namespaces[nsid - 1];
 
     switch (cmd->opcode) {
+    case NVME_CMD_T_BEGIN:
+    case NVME_CMD_T_ABORT:
+    case NVME_CMD_T_WRITE:
+    case NVME_CMD_T_COMMIT:
+        femu_log("msm: execute t cmd now");
+        return NVME_SUCCESS;   
     case NVME_CMD_FLUSH:
         if (!n->id_ctrl.vwc || !n->features.volatile_wc) {
             return NVME_SUCCESS;
