@@ -1,6 +1,13 @@
 {
     "files.associations": {
         "units.h": "c",
-        "cutils.h": "c"
-    }
+        "cutils.h": "c",
+        "nvme.h": "c",
+        "msix.h": "c",
+        "*.inc": "c",
+        "ftl.h": "c",
+        "errno.h": "c",
+        "glib.h": "c"
+    },
+    "cmake.sourceDirectory": "${workspaceFolder}/capstone"
 }

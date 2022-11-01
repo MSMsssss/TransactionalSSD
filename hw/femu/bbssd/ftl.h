@@ -6,6 +6,9 @@
 #define INVALID_PPA     (~(0ULL))
 #define INVALID_LPN     (~(0ULL))
 #define UNMAPPED_PPA    (~(0ULL))
+#define MAX_LPN_PER_TX  (2048)
+#define MAX_TX_NUM      (2048)
+#define INVALID_TX_ID   (~(0U))
 
 enum {
     NAND_READ =  0,
@@ -42,6 +45,12 @@ enum {
     FEMU_RESET_ACCT = 5,
     FEMU_ENABLE_LOG = 6,
     FEMU_DISABLE_LOG = 7,
+};
+
+enum {
+    TX_INIT = 0,
+    TX_COMMIT = 1,
+    TX_ABORT = 2
 };
 
 
@@ -194,6 +203,19 @@ struct nand_cmd {
     int64_t stime; /* Coperd: request arrival time */
 };
 
+struct map_data {
+    uint64_t lpn;   // logic page 4K
+    struct ppa ppn; // phy page
+};
+
+/* transcation meta data entry */
+struct tx_table_entry {
+    int32_t tx_id;
+    int32_t status;
+    struct map_data map_data_array[MAX_LPN_PER_TX];
+    int32_t lpn_count;   
+};
+
 struct ssd {
     char *ssdname;
     struct ssdparams sp;
@@ -202,6 +224,9 @@ struct ssd {
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
     struct write_pointer wp;
     struct line_mgmt lm;
+    struct tx_table_entry* tx_table;
+    idx_pool* tx_idx_pool;
+
 
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;

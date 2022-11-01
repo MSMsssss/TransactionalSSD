@@ -144,6 +144,10 @@ struct rte_ring {
 	struct rte_ring_headtail cons;
 };
 
+typedef struct idx_pool {
+	struct rte_ring* idx_ring;
+} idx_pool;
+
 #define RING_F_SP_ENQ 0x0001 /**< The default enqueue is "single-producer". */
 #define RING_F_SC_DEQ 0x0002 /**< The default dequeue is "single-consumer". */
 /**
@@ -1174,7 +1178,10 @@ size_t femu_ring_enqueue(struct rte_ring *ring, void **objs, size_t count);
  */
 size_t femu_ring_dequeue(struct rte_ring *ring, void **objs, size_t count);
 
-
+idx_pool* idx_pool_create(int count);
+int idx_pool_alloc(idx_pool* pool);
+int idx_pool_free(idx_pool* pool, int idx);
+int idx_pool_destroy(idx_pool* pool);
 
 #ifdef __cplusplus
 }

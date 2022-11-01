@@ -77,6 +77,7 @@
 #include <inttypes.h>
 #include <errno.h>
 #include <sys/queue.h>
+#include <glib.h>
 
 #include "../inc/rte_ring.h"
 
@@ -230,3 +231,58 @@ size_t femu_ring_dequeue(struct rte_ring *ring, void **objs, size_t count)
 	return rte_ring_dequeue_burst((struct rte_ring *)ring, objs, count, NULL);
 }
 
+idx_pool* idx_pool_create(int count) {
+	idx_pool* obj = malloc(sizeof(idx_pool));
+	if (obj == NULL) {
+		return NULL;
+	}
+
+	obj->idx_ring = femu_ring_create(FEMU_RING_TYPE_SP_SC, count);
+	if (obj->idx_ring == NULL) {
+		free(obj);
+		return NULL;
+	}
+
+	int *ptr;
+	for (int i = 0; i < count; i++) {
+		ptr = (int*)(uint64_t)i;
+		femu_ring_enqueue(obj->idx_ring, (void*)&ptr, 1);
+	}
+
+	return obj;
+}
+
+int idx_pool_alloc(idx_pool* pool) {
+	if (pool == NULL || pool->idx_ring == NULL) {
+		return -ENOBUFS;
+	}
+
+	int* ptr;
+	int ret;
+
+	ret = femu_ring_dequeue(pool->idx_ring, (void*)&ptr, 1);
+	if (ret == 0) {
+		return -ENOBUFS;
+	}
+
+	return (int)(uint64_t)ptr;
+}
+
+int idx_pool_free(idx_pool* pool, int idx) {
+	int* ptr = (int*)(uint64_t)idx;
+	int ret;
+
+	ret = femu_ring_enqueue(pool->idx_ring, (void*)&ptr, 1);
+	if (ret == 0) {
+		return -ENOBUFS;
+	}
+
+	return 0;
+}
+
+int idx_pool_destroy(idx_pool* pool) {
+	femu_ring_free(pool->idx_ring);
+	free(pool);
+
+	return 0;
+}

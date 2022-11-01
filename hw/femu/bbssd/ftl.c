@@ -360,6 +360,19 @@ static void ssd_init_rmap(struct ssd *ssd)
     }
 }
 
+static void ssd_init_tx_module(struct ssd* ssd) {
+    ssd->tx_table = g_malloc0(sizeof(struct tx_table_entry) * MAX_TX_NUM);
+    ssd->tx_idx_pool = idx_pool_create(MAX_TX_NUM);
+
+    if (ssd->tx_table == NULL) {
+        femu_log("tx table init failed");
+    }
+
+    if (ssd->tx_idx_pool == NULL) {
+        femu_log("idx pool init failed");
+    }
+}
+
 void ssd_init(FemuCtrl *n)
 {
     struct ssd *ssd = n->ssd;
@@ -386,6 +399,9 @@ void ssd_init(FemuCtrl *n)
 
     /* initialize write pointer, this is how we allocate new pages for writes */
     ssd_init_write_pointer(ssd);
+
+    /* initialize transcation module */
+    ssd_init_tx_module(ssd);
 
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
                        QEMU_THREAD_JOINABLE);
@@ -858,6 +874,47 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     return maxlat;
 }
 
+static uint64_t ssd_begin(struct ssd *ssd, NvmeRequest *req) {
+    int ret;
+    ret = idx_pool_alloc(ssd->tx_idx_pool);
+    if (ret < 0) {
+        // tx table is full
+        req->cqe.n.result = cpu_to_le32(INVALID_TX_ID);
+    } else {
+        // return tx_id to host
+        req->cqe.n.result = cpu_to_le32((uint32_t)ret);
+    }
+
+    return 0;
+}
+
+static uint64_t ssd_twrite(struct ssd *ssd, NvmeRequest *req) {
+    return 0;
+}
+
+static uint64_t ssd_commit(struct ssd *ssd, NvmeRequest *req) {
+    return 0;
+}
+
+static uint64_t ssd_abort(struct ssd *ssd, NvmeRequest *req) {\
+    NvmeTxAdminCmd* cmd = (NvmeTxAdminCmd*)&req->cmd;
+    int txid, ret;
+
+    txid = (int)le32_to_cpu(cmd->txid);
+    if (!(txid >= 0 && txid < MAX_TX_NUM)) {
+        femu_log("invalid tx id to free");
+        return 0;
+    }
+
+    ret = idx_pool_free(ssd->tx_idx_pool, txid);
+    if (ret < 0) {
+        femu_log("free idx failed");
+        return 0;
+    }
+
+    return 0;
+}
+
 static void *ftl_thread(void *arg)
 {
     FemuCtrl *n = (FemuCtrl *)arg;
@@ -888,10 +945,16 @@ static void *ftl_thread(void *arg)
             ftl_assert(req);
             switch (req->cmd.opcode) {
             case NVME_CMD_T_BEGIN:
+                lat = ssd_begin(ssd, req);
+                break;
             case NVME_CMD_T_ABORT:
+                lat = ssd_abort(ssd, req);
+                break;
             case NVME_CMD_T_WRITE:
+                lat = ssd_twrite(ssd, req);
+                break;
             case NVME_CMD_T_COMMIT:
-                lat = 10000;
+                lat = ssd_commit(ssd, req);
                 break;
             case NVME_CMD_WRITE:
                 lat = ssd_write(ssd, req);
