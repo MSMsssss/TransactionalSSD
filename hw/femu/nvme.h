@@ -453,6 +453,25 @@ typedef struct NvmeTxAdminCmd {
     uint32_t    cdw15;
 } NvmeTxAdminCmd;
 
+typedef struct NvmeTxWriteCmd {
+    uint8_t     opcode;
+    uint8_t     flags;
+    uint16_t    cid;
+    uint32_t    nsid;
+    uint32_t    txid;
+    uint32_t    res2;
+    uint64_t    mptr;
+    uint64_t    prp1;
+    uint64_t    prp2;
+    uint64_t    slba;
+    uint16_t    nlb;
+    uint16_t    control;
+    uint32_t    dsmgmt;
+    uint32_t    reftag;
+    uint16_t    apptag;
+    uint16_t    appmask;
+} NvmeTxWriteCmd;
+
 enum {
     NVME_RW_LR                  = 1 << 15,
     NVME_RW_FUA                 = 1 << 14,
@@ -1513,7 +1532,9 @@ static inline uint16_t nvme_check_mdts(FemuCtrl *n, size_t len)
     do { fprintf(stderr, "[FEMU] Err: " fmt, ## __VA_ARGS__); } while (0)
 
 #define femu_log(fmt, ...) \
-    do { printf("[FEMU] Log: " fmt, ## __VA_ARGS__); } while (0)
+    do { printf("[FEMU] Log: " fmt, ## __VA_ARGS__); \
+         printf("\n"); \
+    } while (0)
 
 
 #endif /* __FEMU_NVME_H */

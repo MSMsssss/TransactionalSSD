@@ -361,7 +361,7 @@ static void ssd_init_rmap(struct ssd *ssd)
 }
 
 static void ssd_init_tx_module(struct ssd* ssd) {
-    ssd->tx_table = g_malloc0(sizeof(struct tx_table_entry) * MAX_TX_NUM);
+    ssd->tx_table = g_malloc0(sizeof(tx_table_entry) * MAX_TX_NUM);
     ssd->tx_idx_pool = idx_pool_create(MAX_TX_NUM);
 
     if (ssd->tx_table == NULL) {
@@ -874,6 +874,10 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     return maxlat;
 }
 
+static inline bool entry_in_use(tx_table_entry* entry) {
+    return entry->in_used == IN_USE_FLAG;
+}
+
 static uint64_t ssd_begin(struct ssd *ssd, NvmeRequest *req) {
     int ret;
     ret = idx_pool_alloc(ssd->tx_idx_pool);
@@ -889,6 +893,22 @@ static uint64_t ssd_begin(struct ssd *ssd, NvmeRequest *req) {
 }
 
 static uint64_t ssd_twrite(struct ssd *ssd, NvmeRequest *req) {
+    struct ssdparams *spp = &ssd->sp;
+    NvmeTxWriteCmd* cmd = (NvmeTxWriteCmd*)&req->cmd;
+    uint32_t txid = le32_to_cpu(cmd->txid);
+    int len  = le16_to_cpu(cmd->nlb) + 1;
+    uint64_t lba = le64_to_cpu(cmd->slba);
+    uint64_t start_lpn = lba / spp->secs_per_pg;
+    uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
+    struct ppa ppa;
+    uint64_t lpn;
+    uint64_t curlat = 0, maxlat = 0;
+    int r;
+
+    if (!(txid < MAX_TX_NUM && entry_in_use(&ssd->tx_table[txid]))) {
+        femu_log("write command carry invalid txid")
+    }
+
     return 0;
 }
 

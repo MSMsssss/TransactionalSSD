@@ -9,6 +9,7 @@
 #define MAX_LPN_PER_TX  (2048)
 #define MAX_TX_NUM      (2048)
 #define INVALID_TX_ID   (~(0U))
+#define IN_USE_FLAG     (1)
 
 enum {
     NAND_READ =  0,
@@ -203,18 +204,19 @@ struct nand_cmd {
     int64_t stime; /* Coperd: request arrival time */
 };
 
-struct map_data {
+typedef struct map_data {
     uint64_t lpn;   // logic page 4K
     struct ppa ppn; // phy page
-};
+} map_data;
 
 /* transcation meta data entry */
-struct tx_table_entry {
+typedef struct tx_table_entry {
+    uint32_t in_used;
     int32_t tx_id;
     int32_t status;
-    struct map_data map_data_array[MAX_LPN_PER_TX];
+    map_data map_data_array[MAX_LPN_PER_TX];
     int32_t lpn_count;   
-};
+} tx_table_entry;
 
 struct ssd {
     char *ssdname;
@@ -224,7 +226,7 @@ struct ssd {
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
     struct write_pointer wp;
     struct line_mgmt lm;
-    struct tx_table_entry* tx_table;
+    tx_table_entry* tx_table;
     idx_pool* tx_idx_pool;
 
 
