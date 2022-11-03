@@ -552,7 +552,7 @@ static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa)
 
     /* update corresponding page status */
     pg = get_pg(ssd, ppa);
-    ftl_assert(pg->status == PG_VALID);
+    ftl_assert(pg->status == PG_VALID || pg->status == PG_UNCOMMITTED);
     pg->status = PG_INVALID;
 
     /* update corresponding block status */
@@ -610,6 +610,30 @@ static void mark_page_valid(struct ssd *ssd, struct ppa *ppa)
     line->vpc++;
 }
 
+static void mark_page_uncommitted(struct ssd *ssd, struct ppa *ppa, int txid, int map_idx)
+{
+    struct nand_block *blk = NULL;
+    struct nand_page *pg = NULL;
+    struct line *line;
+
+    /* update page status */
+    pg = get_pg(ssd, ppa);
+    ftl_assert(pg->status == PG_FREE);
+    pg->status = PG_UNCOMMITTED;
+    pg->txid = txid;
+    pg->map_index = map_idx;
+
+    /* update corresponding block status */
+    blk = get_blk(ssd, ppa);
+    ftl_assert(blk->vpc >= 0 && blk->vpc < ssd->sp.pgs_per_blk);
+    blk->vpc++;
+
+    /* update corresponding line status */
+    line = get_line(ssd, ppa);
+    ftl_assert(line->vpc >= 0 && line->vpc < ssd->sp.pgs_per_line);
+    line->vpc++;
+}
+
 static void mark_block_free(struct ssd *ssd, struct ppa *ppa)
 {
     struct ssdparams *spp = &ssd->sp;
@@ -647,16 +671,35 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
 {
     struct ppa new_ppa;
     struct nand_lun *new_lun;
-    uint64_t lpn = get_rmap_ent(ssd, old_ppa);
+    struct nand_page* page = get_pg(ssd, old_ppa);
+    uint64_t lpn;
+    tx_table_entry* tx_meta_data;
 
     ftl_assert(valid_lpn(ssd, lpn));
+    /* get a new free page */
     new_ppa = get_new_page(ssd);
-    /* update maptbl */
-    set_maptbl_ent(ssd, lpn, &new_ppa);
-    /* update rmap */
-    set_rmap_ent(ssd, lpn, &new_ppa);
 
-    mark_page_valid(ssd, &new_ppa);
+    if (page->status == PG_VALID) {
+        lpn = get_rmap_ent(ssd, old_ppa);
+        /* update maptbl */
+        set_maptbl_ent(ssd, lpn, &new_ppa);
+        /* update rmap */
+        set_rmap_ent(ssd, lpn, &new_ppa);
+
+        mark_page_valid(ssd, &new_ppa);
+    } else if (page->status == PG_UNCOMMITTED) {
+        tx_meta_data = &ssd->tx_table[page->txid];
+        lpn = tx_meta_data->map_data_array[page->map_index].lpn;
+
+        /* update rmap*/
+        set_rmap_ent(ssd, lpn, &new_ppa);
+        /* update tx meta data */
+        tx_meta_data->map_data_array[page->map_index].ppn = new_ppa;
+        mark_page_uncommitted(ssd, &new_ppa, page->txid, page->map_index);
+    } else {
+        femu_log("run to err branch");
+        return 0;
+    }
 
     /* need to advance the write pointer here */
     ssd_advance_write_pointer(ssd);
@@ -715,7 +758,7 @@ static void clean_one_block(struct ssd *ssd, struct ppa *ppa)
         pg_iter = get_pg(ssd, ppa);
         /* there shouldn't be any free page in victim blocks */
         ftl_assert(pg_iter->status != PG_FREE);
-        if (pg_iter->status == PG_VALID) {
+        if (pg_iter->status == PG_VALID || pg_iter->status == PG_UNCOMMITTED) {
             gc_read_page(ssd, ppa);
             /* delay the maptbl update until "write" happens */
             gc_write_page(ssd, ppa);
@@ -878,6 +921,14 @@ static inline bool entry_in_use(tx_table_entry* entry) {
     return entry->in_used == IN_USE_FLAG;
 }
 
+static inline void set_entry_unused(tx_table_entry* entry) {
+    entry->in_used = UN_USE_FLAG;
+}
+
+static inline void set_entry_inused(tx_table_entry* entry) {
+    entry->in_used = IN_USE_FLAG;
+}
+
 static uint64_t ssd_begin(struct ssd *ssd, NvmeRequest *req) {
     int ret;
     ret = idx_pool_alloc(ssd->tx_idx_pool);
@@ -887,6 +938,10 @@ static uint64_t ssd_begin(struct ssd *ssd, NvmeRequest *req) {
     } else {
         // return tx_id to host
         req->cqe.n.result = cpu_to_le32((uint32_t)ret);
+        ssd->tx_table[ret].lpn_count = 0;
+        ssd->tx_table[ret].tx_id = ret;
+        ssd->tx_table[ret].status = TX_INIT;
+        set_entry_inused(&ssd->tx_table[ret]);
     }
 
     return 0;
@@ -903,29 +958,143 @@ static uint64_t ssd_twrite(struct ssd *ssd, NvmeRequest *req) {
     struct ppa ppa;
     uint64_t lpn;
     uint64_t curlat = 0, maxlat = 0;
+    tx_table_entry* tx_meta_data = NULL;
+    map_data* map_info = NULL;
     int r;
 
     if (!(txid < MAX_TX_NUM && entry_in_use(&ssd->tx_table[txid]))) {
-        femu_log("write command carry invalid txid")
-    }
-
-    return 0;
-}
-
-static uint64_t ssd_commit(struct ssd *ssd, NvmeRequest *req) {
-    return 0;
-}
-
-static uint64_t ssd_abort(struct ssd *ssd, NvmeRequest *req) {\
-    NvmeTxAdminCmd* cmd = (NvmeTxAdminCmd*)&req->cmd;
-    int txid, ret;
-
-    txid = (int)le32_to_cpu(cmd->txid);
-    if (!(txid >= 0 && txid < MAX_TX_NUM)) {
-        femu_log("invalid tx id to free");
+        femu_log("write command carry invalid txid");
         return 0;
     }
 
+    tx_meta_data = &ssd->tx_table[txid];
+    if (tx_meta_data->status != TX_INIT) {
+        femu_log("target tx is already committed or abort");
+        return 0;
+    }
+
+    if (end_lpn >= spp->tt_pgs) {
+        ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
+        return 0;
+    }
+
+    while (should_gc_high(ssd)) {
+        /* perform GC here until !should_gc(ssd) */
+        r = do_gc(ssd, true);
+        if (r == -1)
+            break;
+    }
+
+    for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        if (tx_meta_data->lpn_count >= MAX_LPN_PER_TX) {
+            femu_log("too much lpn for one tx");
+            break;
+        }
+        /* get new phy page*/
+        ppa = get_new_page(ssd);
+        /* update map info to tx table */
+        map_info = &tx_meta_data->map_data_array[tx_meta_data->lpn_count];
+        map_info->lpn = lpn;
+        map_info->ppn = ppa;
+
+        /*mark page uncommitted & update rmap table, and update map table when commit */
+        mark_page_uncommitted(ssd, &ppa, txid, tx_meta_data->lpn_count);
+        set_rmap_ent(ssd, lpn, &ppa);
+        
+        /* need to advance the write pointer here */
+        tx_meta_data->lpn_count++;
+        ssd_advance_write_pointer(ssd);
+
+        struct nand_cmd swr;
+        swr.type = USER_IO;
+        swr.cmd = NAND_WRITE;
+        swr.stime = req->stime;
+        /* get latency statistics */
+        curlat = ssd_advance_status(ssd, &ppa, &swr);
+        maxlat = (curlat > maxlat) ? curlat : maxlat;
+    }
+
+    return maxlat;
+}
+
+static uint64_t ssd_commit(struct ssd *ssd, NvmeRequest *req) {
+    NvmeTxWriteCmd* cmd = (NvmeTxWriteCmd*)&req->cmd;
+    uint32_t txid = le32_to_cpu(cmd->txid);
+    tx_table_entry* tx_meta_data = NULL;
+    map_data* map_info = NULL;
+    uint64_t lpn;
+    struct ppa ppn, old_ppn;
+    struct nand_page* page;
+    int ret;
+
+    if (!(txid < MAX_TX_NUM && entry_in_use(&ssd->tx_table[txid]))) {
+        femu_log("write command carry invalid txid");
+        return 0;
+    }
+
+    /* tx with TX_COMMIT flag will redo when SPOR */
+    tx_meta_data = &ssd->tx_table[txid];
+    if (tx_meta_data->status != TX_INIT) {
+        femu_log("tx is already commit or abort, status %d", tx_meta_data->status);
+        return 0;
+    }
+    tx_meta_data->status = TX_COMMIT;
+
+    for (int i = 0; i < tx_meta_data->lpn_count; i++) {
+        map_info = &tx_meta_data->map_data_array[i];
+        lpn = map_info->lpn;
+        ppn = map_info->ppn;
+        old_ppn = get_maptbl_ent(ssd, lpn);
+
+        /* mark old ppn invalid */
+        if (mapped_ppa(&old_ppn)) {
+            mark_page_invalid(ssd, &old_ppn);
+            set_rmap_ent(ssd, INVALID_LPN, &old_ppn);
+        }
+
+        /* page status uncommitted --> valid */
+        page = get_pg(ssd, &ppn);
+        page->status = PG_VALID;
+        set_maptbl_ent(ssd, lpn, &ppn);
+    }
+
+    set_entry_unused(tx_meta_data);
+    ret = idx_pool_free(ssd->tx_idx_pool, txid);
+    if (ret < 0) {
+        femu_log("free idx failed");
+        return 0;
+    }
+
+    return 0;
+}
+
+static uint64_t ssd_abort(struct ssd *ssd, NvmeRequest *req) {
+    NvmeTxWriteCmd* cmd = (NvmeTxWriteCmd*)&req->cmd;
+    uint32_t txid = le32_to_cpu(cmd->txid);
+    tx_table_entry* tx_meta_data = NULL;
+    struct ppa ppn;
+    int ret;
+
+    if (!(txid < MAX_TX_NUM && entry_in_use(&ssd->tx_table[txid]))) {
+        femu_log("abort command carry invalid txid");
+    }
+
+    tx_meta_data = &ssd->tx_table[txid];
+    if (tx_meta_data->status != TX_INIT) {
+        femu_log("tx is already commit or abort, status %d", tx_meta_data->status);
+        return 0;
+    }
+    tx_meta_data->status = TX_ABORT;
+
+    for (int i = 0; i < tx_meta_data->lpn_count; i++) {
+        ppn = tx_meta_data->map_data_array[i].ppn;
+
+        /* mark allocated page invalid */
+        mark_page_invalid(ssd, &ppn);
+        set_rmap_ent(ssd, INVALID_LPN, &ppn);
+    }
+
+    set_entry_unused(tx_meta_data);
     ret = idx_pool_free(ssd->tx_idx_pool, txid);
     if (ret < 0) {
         femu_log("free idx failed");

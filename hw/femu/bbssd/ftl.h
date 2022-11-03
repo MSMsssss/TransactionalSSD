@@ -10,6 +10,7 @@
 #define MAX_TX_NUM      (2048)
 #define INVALID_TX_ID   (~(0U))
 #define IN_USE_FLAG     (1)
+#define UN_USE_FLAG     (0)
 
 enum {
     NAND_READ =  0,
@@ -33,7 +34,8 @@ enum {
 
     PG_FREE = 0,
     PG_INVALID = 1,
-    PG_VALID = 2
+    PG_VALID = 2,
+    PG_UNCOMMITTED = 3
 };
 
 enum {
@@ -85,6 +87,8 @@ struct nand_page {
     nand_sec_status_t *sec;
     int nsecs;
     int status;
+    int txid;   // It can be ignore if status is not UNCOMMITTED
+    int map_index;  //  It can be ignore if status is not UNCOMMITTED
 };
 
 struct nand_block {
