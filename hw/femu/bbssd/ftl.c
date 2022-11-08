@@ -3,6 +3,8 @@
 //#define FEMU_DEBUG_FTL
 
 static void *ftl_thread(void *arg);
+static uint64_t __ssd_commit(struct ssd *ssd, uint32_t txid);
+static uint64_t __ssd_abort(struct ssd *ssd, uint32_t txid);
 
 static inline bool should_gc(struct ssd *ssd)
 {
@@ -929,6 +931,29 @@ static inline void set_entry_inused(tx_table_entry* entry) {
     entry->in_used = IN_USE_FLAG;
 }
 
+static void check_timeout_tx(struct ssd *ssd) {
+    int64_t cur_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    tx_table_entry* tx_table = ssd->tx_table;
+    int64_t delta_time = cur_time - ssd->check_tx_timeout_timer;
+    
+    // check once per TX_TIME_OUT_VALUE
+    if (delta_time < TX_TIME_OUT_VALUE) {
+        return;
+    }
+
+    ssd->check_tx_timeout_timer = cur_time;
+    for (int i = 0; i < MAX_TX_NUM; i++) {
+        if (entry_in_use(&tx_table[i]) && tx_table[i].status == TX_INIT) {
+            delta_time = cur_time - tx_table[i].start_time;
+            if (delta_time > TX_TIME_OUT_VALUE) {
+                __ssd_abort(ssd, tx_table[i].tx_id);
+            }
+        }
+    }
+
+    return;
+}
+
 static uint64_t ssd_begin(struct ssd *ssd, NvmeRequest *req) {
     int ret;
     ret = idx_pool_alloc(ssd->tx_idx_pool);
@@ -941,8 +966,11 @@ static uint64_t ssd_begin(struct ssd *ssd, NvmeRequest *req) {
         ssd->tx_table[ret].lpn_count = 0;
         ssd->tx_table[ret].tx_id = ret;
         ssd->tx_table[ret].status = TX_INIT;
+        ssd->tx_table[ret].start_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
         set_entry_inused(&ssd->tx_table[ret]);
     }
+
+    femu_debug("begin with idx %d", ret);
 
     return 0;
 }
@@ -961,6 +989,8 @@ static uint64_t ssd_twrite(struct ssd *ssd, NvmeRequest *req) {
     tx_table_entry* tx_meta_data = NULL;
     map_data* map_info = NULL;
     int r;
+
+    femu_debug("twrite with txid: %u", (unsigned)txid);
 
     if (!(txid < MAX_TX_NUM && entry_in_use(&ssd->tx_table[txid]))) {
         femu_log("write command carry invalid txid");
@@ -1017,9 +1047,7 @@ static uint64_t ssd_twrite(struct ssd *ssd, NvmeRequest *req) {
     return maxlat;
 }
 
-static uint64_t ssd_commit(struct ssd *ssd, NvmeRequest *req) {
-    NvmeTxWriteCmd* cmd = (NvmeTxWriteCmd*)&req->cmd;
-    uint32_t txid = le32_to_cpu(cmd->txid);
+static uint64_t __ssd_commit(struct ssd *ssd, uint32_t txid) {
     tx_table_entry* tx_meta_data = NULL;
     map_data* map_info = NULL;
     uint64_t lpn;
@@ -1027,6 +1055,7 @@ static uint64_t ssd_commit(struct ssd *ssd, NvmeRequest *req) {
     struct nand_page* page;
     int ret;
 
+    femu_debug("commit with txid: %u", (unsigned)txid);
     if (!(txid < MAX_TX_NUM && entry_in_use(&ssd->tx_table[txid]))) {
         femu_log("write command carry invalid txid");
         return 0;
@@ -1068,13 +1097,19 @@ static uint64_t ssd_commit(struct ssd *ssd, NvmeRequest *req) {
     return 0;
 }
 
-static uint64_t ssd_abort(struct ssd *ssd, NvmeRequest *req) {
+static uint64_t ssd_commit(struct ssd *ssd, NvmeRequest *req) {
     NvmeTxWriteCmd* cmd = (NvmeTxWriteCmd*)&req->cmd;
     uint32_t txid = le32_to_cpu(cmd->txid);
+
+    return __ssd_commit(ssd, txid);
+}
+
+static uint64_t __ssd_abort(struct ssd *ssd, uint32_t txid) {
     tx_table_entry* tx_meta_data = NULL;
     struct ppa ppn;
     int ret;
 
+    femu_debug("abort with txid: %u", (unsigned)txid);
     if (!(txid < MAX_TX_NUM && entry_in_use(&ssd->tx_table[txid]))) {
         femu_log("abort command carry invalid txid");
     }
@@ -1104,6 +1139,13 @@ static uint64_t ssd_abort(struct ssd *ssd, NvmeRequest *req) {
     return 0;
 }
 
+static uint64_t ssd_abort(struct ssd *ssd, NvmeRequest *req) {
+    NvmeTxWriteCmd* cmd = (NvmeTxWriteCmd*)&req->cmd;
+    uint32_t txid = le32_to_cpu(cmd->txid);
+
+    return __ssd_abort(ssd, txid);
+}
+
 static void *ftl_thread(void *arg)
 {
     FemuCtrl *n = (FemuCtrl *)arg;
@@ -1120,6 +1162,7 @@ static void *ftl_thread(void *arg)
     /* FIXME: not safe, to handle ->to_ftl and ->to_poller gracefully */
     ssd->to_ftl = n->to_ftl;
     ssd->to_poller = n->to_poller;
+    ssd->check_tx_timeout_timer = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
 
     while (1) {
         for (i = 1; i <= n->num_poller; i++) {
@@ -1172,6 +1215,8 @@ static void *ftl_thread(void *arg)
                 do_gc(ssd, false);
             }
         }
+
+        check_timeout_tx(ssd);
     }
 
     return NULL;

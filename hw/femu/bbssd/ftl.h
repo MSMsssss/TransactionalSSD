@@ -3,6 +3,7 @@
 
 #include "../nvme.h"
 
+
 #define INVALID_PPA     (~(0ULL))
 #define INVALID_LPN     (~(0ULL))
 #define UNMAPPED_PPA    (~(0ULL))
@@ -11,6 +12,8 @@
 #define INVALID_TX_ID   (~(0U))
 #define IN_USE_FLAG     (1)
 #define UN_USE_FLAG     (0)
+
+#define TX_TIME_OUT_VALUE (3000)    //3000ms
 
 enum {
     NAND_READ =  0,
@@ -215,6 +218,7 @@ typedef struct map_data {
 
 /* transcation meta data entry */
 typedef struct tx_table_entry {
+    int64_t start_time; // this entry alloc time, free when timeout
     uint32_t in_used;
     int32_t tx_id;
     int32_t status;
@@ -232,7 +236,7 @@ struct ssd {
     struct line_mgmt lm;
     tx_table_entry* tx_table;
     idx_pool* tx_idx_pool;
-
+    int64_t check_tx_timeout_timer;
 
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;

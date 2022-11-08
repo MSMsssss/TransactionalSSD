@@ -1522,7 +1522,9 @@ static inline uint16_t nvme_check_mdts(FemuCtrl *n, size_t len)
 #define FEMU_DEBUG_NVME
 #ifdef FEMU_DEBUG_NVME
 #define femu_debug(fmt, ...) \
-    do { printf("[FEMU] Dbg: " fmt, ## __VA_ARGS__); } while (0)
+    do { printf("[FEMU] Dbg: " fmt, ## __VA_ARGS__); \
+         printf("\n"); \
+    } while (0)
 #else
 #define femu_debug(fmt, ...) \
     do { } while (0)
