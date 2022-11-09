@@ -459,7 +459,7 @@ typedef struct NvmeTxWriteCmd {
     uint16_t    cid;
     uint32_t    nsid;
     uint32_t    txid;
-    uint32_t    res2;
+    uint32_t    seqid;
     uint64_t    mptr;
     uint64_t    prp1;
     uint64_t    prp2;

@@ -365,6 +365,7 @@ static void ssd_init_rmap(struct ssd *ssd)
 static void ssd_init_tx_module(struct ssd* ssd) {
     ssd->tx_table = g_malloc0(sizeof(tx_table_entry) * MAX_TX_NUM);
     ssd->tx_idx_pool = idx_pool_create(MAX_TX_NUM);
+    ssd->temp_sort_buffer = g_malloc0(sizeof(struct map_data) * MAX_LPN_PER_TX);
 
     if (ssd->tx_table == NULL) {
         femu_log("tx table init failed");
@@ -979,6 +980,7 @@ static uint64_t ssd_twrite(struct ssd *ssd, NvmeRequest *req) {
     struct ssdparams *spp = &ssd->sp;
     NvmeTxWriteCmd* cmd = (NvmeTxWriteCmd*)&req->cmd;
     uint32_t txid = le32_to_cpu(cmd->txid);
+    uint32_t seqid = le32_to_cpu(cmd->seqid);
     int len  = le16_to_cpu(cmd->nlb) + 1;
     uint64_t lba = le64_to_cpu(cmd->slba);
     uint64_t start_lpn = lba / spp->secs_per_pg;
@@ -1026,6 +1028,7 @@ static uint64_t ssd_twrite(struct ssd *ssd, NvmeRequest *req) {
         map_info = &tx_meta_data->map_data_array[tx_meta_data->lpn_count];
         map_info->lpn = lpn;
         map_info->ppn = ppa;
+        map_info->seq_id = seqid;
 
         /*mark page uncommitted & update rmap table, and update map table when commit */
         mark_page_uncommitted(ssd, &ppa, txid, tx_meta_data->lpn_count);
@@ -1045,6 +1048,10 @@ static uint64_t ssd_twrite(struct ssd *ssd, NvmeRequest *req) {
     }
 
     return maxlat;
+}
+
+static inline int map_data_cmp(const void* m1, const void* m2) {
+    return (int)(((struct map_data*)m1)->seq_id) - (int)(((struct map_data*)m2)->seq_id);
 }
 
 static uint64_t __ssd_commit(struct ssd *ssd, uint32_t txid) {
@@ -1069,8 +1076,13 @@ static uint64_t __ssd_commit(struct ssd *ssd, uint32_t txid) {
     }
     tx_meta_data->status = TX_COMMIT;
 
+    /* need sort map data by seqid to ensure data update order */
+    memcpy((void*)ssd->temp_sort_buffer, (void*)tx_meta_data->map_data_array, 
+            tx_meta_data->lpn_count * sizeof(struct map_data));
+    qsort((void*)ssd->temp_sort_buffer, tx_meta_data->lpn_count, sizeof(struct map_data), map_data_cmp);
+
     for (int i = 0; i < tx_meta_data->lpn_count; i++) {
-        map_info = &tx_meta_data->map_data_array[i];
+        map_info = &ssd->temp_sort_buffer[i];
         lpn = map_info->lpn;
         ppn = map_info->ppn;
         old_ppn = get_maptbl_ent(ssd, lpn);

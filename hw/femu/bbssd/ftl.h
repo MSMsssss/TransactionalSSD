@@ -212,8 +212,9 @@ struct nand_cmd {
 };
 
 typedef struct map_data {
-    uint64_t lpn;   // logic page 4K
-    struct ppa ppn; // phy page
+    uint32_t seq_id; // seq id mark the bio's order in tx
+    uint64_t lpn;    // logic page 4K
+    struct ppa ppn;  // phy page
 } map_data;
 
 /* transcation meta data entry */
@@ -234,8 +235,11 @@ struct ssd {
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
     struct write_pointer wp;
     struct line_mgmt lm;
+
+    /* tx module data */
     tx_table_entry* tx_table;
     idx_pool* tx_idx_pool;
+    map_data* temp_sort_buffer;
     int64_t check_tx_timeout_timer;
 
     /* lockless ring for communication with NVMe IO thread */
