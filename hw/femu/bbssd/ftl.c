@@ -976,6 +976,46 @@ static uint64_t ssd_begin(struct ssd *ssd, NvmeRequest *req) {
     return 0;
 }
 
+static uint64_t ssd_tread(struct ssd *ssd, NvmeRequest *req)
+{
+    NvmeTxReadCmd* cmd = (NvmeTxReadCmd*)&req->cmd;
+    int len  = le16_to_cpu(cmd->nlb) + 1;
+    uint64_t lba = le64_to_cpu(cmd->slba);
+    struct ssdparams *spp = &ssd->sp;
+    struct ppa ppa;
+    uint64_t start_lpn = lba / spp->secs_per_pg;
+    uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
+    uint64_t lpn;
+    uint64_t sublat, maxlat = 0;
+
+    femu_debug("read: lba(%d), len(%d)", (int)lba, (int)len);
+
+    if (end_lpn >= spp->tt_pgs) {
+        ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
+    }
+
+    /* normal IO read path */
+    for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        ppa = get_maptbl_ent(ssd, lpn);
+        if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) {
+            //printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
+            //printf("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n",
+            //ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
+            femu_log("read no data lpn");
+            continue;
+        }
+
+        struct nand_cmd srd;
+        srd.type = USER_IO;
+        srd.cmd = NAND_READ;
+        srd.stime = req->stime;
+        sublat = ssd_advance_status(ssd, &ppa, &srd);
+        maxlat = (sublat > maxlat) ? sublat : maxlat;
+    }
+
+    return maxlat;
+}
+
 static uint64_t ssd_twrite(struct ssd *ssd, NvmeRequest *req) {
     struct ssdparams *spp = &ssd->sp;
     NvmeTxWriteCmd* cmd = (NvmeTxWriteCmd*)&req->cmd;
@@ -1196,6 +1236,9 @@ static void *ftl_thread(void *arg)
                 break;
             case NVME_CMD_T_WRITE:
                 lat = ssd_twrite(ssd, req);
+                break;
+            case NVME_CMD_T_READ:
+                lat = ssd_tread(ssd, req);
                 break;
             case NVME_CMD_T_COMMIT:
                 lat = ssd_commit(ssd, req);

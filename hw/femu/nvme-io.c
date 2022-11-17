@@ -494,6 +494,8 @@ static uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
     switch (cmd->opcode) {
     case NVME_CMD_T_BEGIN:
     case NVME_CMD_T_ABORT:
+    case NVME_CMD_T_READ:
+    case NVME_CMD_T_AREA_SET:
     case NVME_CMD_T_WRITE:
     case NVME_CMD_T_COMMIT:
         return NVME_SUCCESS;   

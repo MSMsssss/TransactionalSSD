@@ -341,7 +341,9 @@ enum NvmeIoCommands {
     NVME_CMD_ZONE_MGMT_SEND     = 0x79,
     NVME_CMD_ZONE_MGMT_RECV     = 0x7a,
     NVME_CMD_ZONE_APPEND        = 0x7d,
+    NVME_CMD_T_AREA_SET         = 0x80,
     NVME_CMD_T_WRITE            = 0x81,
+    NVME_CMD_T_READ             = 0x82,
     NVME_CMD_T_BEGIN            = 0x84,
     NVME_CMD_T_COMMIT           = 0x88,
     NVME_CMD_T_ABORT            = 0x8c,
@@ -471,6 +473,24 @@ typedef struct NvmeTxWriteCmd {
     uint16_t    apptag;
     uint16_t    appmask;
 } NvmeTxWriteCmd;
+
+typedef struct NvmeTxReadCmd {
+    uint8_t     opcode;
+    uint8_t     flags;
+    uint16_t    cid;
+    uint32_t    nsid;
+    uint64_t    timestamp;
+    uint64_t    mptr;
+    uint64_t    prp1;
+    uint64_t    prp2;
+    uint64_t    slba;
+    uint16_t    nlb;
+    uint16_t    control;
+    uint32_t    dsmgmt;
+    uint32_t    reftag;
+    uint16_t    apptag;
+    uint16_t    appmask;
+} NvmeTxReadCmd;
 
 enum {
     NVME_RW_LR                  = 1 << 15,
@@ -1519,7 +1539,6 @@ static inline uint16_t nvme_check_mdts(FemuCtrl *n, size_t len)
 #define MN_MAX_LEN (64)
 #define ID_MAX_LEN (4)
 
-#define FEMU_DEBUG_NVME
 #ifdef FEMU_DEBUG_NVME
 #define femu_debug(fmt, ...) \
     do { printf("[FEMU] Dbg: " fmt, ## __VA_ARGS__); \
@@ -1533,11 +1552,16 @@ static inline uint16_t nvme_check_mdts(FemuCtrl *n, size_t len)
 #define femu_err(fmt, ...) \
     do { fprintf(stderr, "[FEMU] Err: " fmt, ## __VA_ARGS__); } while (0)
 
+#define FEMU_PRINT_LOG
+#ifdef FEMU_PRINT_LOG
 #define femu_log(fmt, ...) \
     do { printf("[FEMU] Log: " fmt, ## __VA_ARGS__); \
          printf("\n"); \
     } while (0)
-
+#else
+#define femu_log(fmt, ...) \
+    do { } while (0)
+#endif
 
 #endif /* __FEMU_NVME_H */
 
