@@ -5,6 +5,9 @@
 static void *ftl_thread(void *arg);
 static uint64_t __ssd_commit(struct ssd *ssd, uint32_t txid);
 static uint64_t __ssd_abort(struct ssd *ssd, uint32_t txid);
+static inline struct map_data* get_version_data_from_ppa(struct ssd* ssd, struct ppa* ppa);
+static inline uint64_t get_map_data_entry_index(struct ssd *ssd, struct map_data *entry);
+static bool map_entry_is_index(struct ppa* ppa);
 
 static inline bool should_gc(struct ssd *ssd)
 {
@@ -14,6 +17,10 @@ static inline bool should_gc(struct ssd *ssd)
 static inline bool should_gc_high(struct ssd *ssd)
 {
     return (ssd->lm.free_line_cnt <= ssd->sp.gc_thres_lines_high);
+}
+
+static inline struct ppa* get_maptbl_ent_pointer(struct ssd* ssd, uint64_t lpn) {
+    return &ssd->maptbl[lpn];
 }
 
 static inline struct ppa get_maptbl_ent(struct ssd *ssd, uint64_t lpn)
@@ -81,6 +88,29 @@ static inline size_t victim_line_get_pos(void *a)
 static inline void victim_line_set_pos(void *a, size_t pos)
 {
     ((struct line *)a)->pos = pos;
+}
+
+static inline int map_data_cmp_pri(pqueue_pri_t next, pqueue_pri_t curr)
+{
+    return (next > curr);
+}
+
+static inline pqueue_pri_t map_data_get_pri(void *a)
+{
+    return (pqueue_pri_t)(((map_data *)a)->write_ts);
+}
+
+static inline void map_data_set_pri(void *a, pqueue_pri_t pri)
+{
+    ((map_data *)a)->write_ts = (uint64_t)pri;
+}
+
+static inline size_t map_data_get_pos(void *a) {
+    return ((map_data*)a)->pos;
+}
+
+static inline void map_data_set_pos(void *a, size_t pos) {
+    ((map_data*)a)->pos = pos;
 }
 
 static void ssd_init_lines(struct ssd *ssd)
@@ -365,7 +395,15 @@ static void ssd_init_rmap(struct ssd *ssd)
 static void ssd_init_tx_module(struct ssd* ssd) {
     ssd->tx_table = g_malloc0(sizeof(tx_table_entry) * MAX_TX_NUM);
     ssd->tx_idx_pool = idx_pool_create(MAX_TX_NUM);
-    ssd->temp_sort_buffer = g_malloc0(sizeof(struct map_data) * MAX_LPN_PER_TX);
+    ssd->map_data_idx_pool = idx_pool_create(MAX_LENGTH_OF_META_DATA_LIST);
+    ssd->map_data_table = g_malloc0(sizeof(map_data) * MAX_LENGTH_OF_META_DATA_LIST);
+    ssd->min_ts_active = 0;
+    ssd->read_ts_table = g_malloc0(sizeof(uint64_t) * ssd->sp.tt_pgs);
+    ssd->read_map_buffer = g_malloc0(sizeof(tx_map_result_enrty) * MAX_LPN_PER_TX);
+    ssd->old_version_gc_threshold = 0.8;
+    ssd->committed_queue = pqueue_init(MAX_LENGTH_OF_META_DATA_LIST, map_data_cmp_pri, 
+                                       map_data_get_pri, map_data_set_pri, 
+                                       map_data_get_pos, map_data_set_pos);
 
     if (ssd->tx_table == NULL) {
         femu_log("tx table init failed");
@@ -373,6 +411,18 @@ static void ssd_init_tx_module(struct ssd* ssd) {
 
     if (ssd->tx_idx_pool == NULL) {
         femu_log("idx pool init failed");
+    }
+
+    if (ssd->map_data_table == NULL) {
+        femu_log("map data table init failed");
+    }
+
+    if (ssd->map_data_idx_pool == NULL) {
+        femu_log("map data idx pool init failed");
+    }
+
+    for (int i = 0; i < MAX_LENGTH_OF_META_DATA_LIST; i++) {
+        ssd->map_data_table[i] = TX_MAP_DATA_INVALID;
     }
 }
 
@@ -555,7 +605,7 @@ static void mark_page_invalid(struct ssd *ssd, struct ppa *ppa)
 
     /* update corresponding page status */
     pg = get_pg(ssd, ppa);
-    ftl_assert(pg->status == PG_VALID || pg->status == PG_UNCOMMITTED);
+    ftl_assert(pg->status == PG_VALID || pg->status == PG_UNCOMMITTED pg->status == PG_OLD_VERSION);
     pg->status = PG_INVALID;
 
     /* update corresponding block status */
@@ -613,7 +663,7 @@ static void mark_page_valid(struct ssd *ssd, struct ppa *ppa)
     line->vpc++;
 }
 
-static void mark_page_uncommitted(struct ssd *ssd, struct ppa *ppa, int txid, int map_idx)
+static void mark_page_uncommitted(struct ssd *ssd, struct ppa *ppa, uint32_t map_data_index)
 {
     struct nand_block *blk = NULL;
     struct nand_page *pg = NULL;
@@ -623,8 +673,7 @@ static void mark_page_uncommitted(struct ssd *ssd, struct ppa *ppa, int txid, in
     pg = get_pg(ssd, ppa);
     ftl_assert(pg->status == PG_FREE);
     pg->status = PG_UNCOMMITTED;
-    pg->txid = txid;
-    pg->map_index = map_idx;
+    pg->map_data_index = map_data_index;
 
     /* update corresponding block status */
     blk = get_blk(ssd, ppa);
@@ -676,7 +725,8 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
     struct nand_lun *new_lun;
     struct nand_page* page = get_pg(ssd, old_ppa);
     uint64_t lpn;
-    tx_table_entry* tx_meta_data;
+    struct map_data *map_info, *version_ptr = NULL;
+    struct ppa *ppa_ptr = NULL;
 
     ftl_assert(valid_lpn(ssd, lpn));
     /* get a new free page */
@@ -684,21 +734,26 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
 
     if (page->status == PG_VALID) {
         lpn = get_rmap_ent(ssd, old_ppa);
-        /* update maptbl */
-        set_maptbl_ent(ssd, lpn, &new_ppa);
+        ppa_ptr = get_maptbl_ent_pointer(ssd, lpn);
+        while (map_entry_is_index(ppa_ptr)) {
+            version_ptr = get_version_data_from_ppa(ssd, ppa_ptr);
+            ppa_ptr = &version_ptr->next;
+        }
+
+        *ppa_ptr = new_ppa;
         /* update rmap */
         set_rmap_ent(ssd, lpn, &new_ppa);
-
         mark_page_valid(ssd, &new_ppa);
-    } else if (page->status == PG_UNCOMMITTED) {
-        tx_meta_data = &ssd->tx_table[page->txid];
-        lpn = tx_meta_data->map_data_array[page->map_index].lpn;
+    } else if (page->status == PG_UNCOMMITTED || page->status == PG_OLD_VERSION) {
+        map_info = &ssd->map_data_table[page->map_data_index];
+        lpn = map_info->lpn;
 
         /* update rmap*/
         set_rmap_ent(ssd, lpn, &new_ppa);
         /* update tx meta data */
-        tx_meta_data->map_data_array[page->map_index].ppn = new_ppa;
-        mark_page_uncommitted(ssd, &new_ppa, page->txid, page->map_index);
+        map_info->ppn = new_ppa;
+        mark_page_uncommitted(ssd, &new_ppa, page->map_data_index);
+        get_pg(ssd, new_ppa)->status = page->status;
     } else {
         femu_log("run to err branch");
         return 0;
@@ -761,7 +816,7 @@ static void clean_one_block(struct ssd *ssd, struct ppa *ppa)
         pg_iter = get_pg(ssd, ppa);
         /* there shouldn't be any free page in victim blocks */
         ftl_assert(pg_iter->status != PG_FREE);
-        if (pg_iter->status == PG_VALID || pg_iter->status == PG_UNCOMMITTED) {
+        if (pg_iter->status == PG_VALID || pg_iter->status == PG_UNCOMMITTED || pg_iter->status == PG_OLD_VERSION) {
             gc_read_page(ssd, ppa);
             /* delay the maptbl update until "write" happens */
             gc_write_page(ssd, ppa);
@@ -920,6 +975,14 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     return maxlat;
 }
 
+static bool map_entry_is_index(struct ppa* ppa) {
+    if (!mapped_ppa(ppa)) {
+        return false;
+    }
+
+    return ppa->idx.isIndex == PPA_IS_INDEX_FLAG;
+}
+
 static inline bool entry_in_use(tx_table_entry* entry) {
     return entry->in_used == IN_USE_FLAG;
 }
@@ -956,6 +1019,7 @@ static void check_timeout_tx(struct ssd *ssd) {
 }
 
 static uint64_t ssd_begin(struct ssd *ssd, NvmeRequest *req) {
+    NvmeTxAdminCmd* cmd = (NvmeTxAdminCmd*)&req->cmd;
     int ret;
     ret = idx_pool_alloc(ssd->tx_idx_pool);
     if (ret < 0) {
@@ -968,6 +1032,7 @@ static uint64_t ssd_begin(struct ssd *ssd, NvmeRequest *req) {
         ssd->tx_table[ret].tx_id = ret;
         ssd->tx_table[ret].status = TX_INIT;
         ssd->tx_table[ret].start_time = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        ssd->tx_table[ret].tx_timestamp = le64_to_cpu(cmd->timestamp);
         set_entry_inused(&ssd->tx_table[ret]);
     }
 
@@ -976,33 +1041,108 @@ static uint64_t ssd_begin(struct ssd *ssd, NvmeRequest *req) {
     return 0;
 }
 
+static int ssd_tread_precheck_one_lpn(struct ssd *ssd, uint64_t lpn, tx_map_result_enrty *result, uint64_t read_ts) {
+    struct map_data *version_ptr;
+    struct ppa *header_ptr = get_maptbl_ent_pointer(ssd, lpn), *ppa_ptr = NULL;
+
+    if (!map_entry_is_index(header_ptr)) {
+        result->ppa = *header_ptr;
+        result->target_read_ts = &ssd->read_ts_table[lpn];
+        return TX_STATUS_OK;
+    }
+
+    ppa_ptr = header_ptr;
+    version_ptr = get_version_data_from_ppa(ssd, ppa_ptr);
+    while (read_ts < version_ptr->write_ts) {
+        ppa_ptr = &version_ptr->next;
+        if (map_entry_is_index(ppa_ptr)) {
+            version_ptr = get_version_data_from_ppa(ssd, ppa_ptr);
+        } else {
+            version_ptr = NULL;
+            break;
+        }
+    }
+
+    if (version_ptr != NULL) {
+        if (version_ptr->status != TX_MAP_DATA_COMMITED) {
+            return -TX_ERROR_READ_UNCOMMITTED;
+        }
+
+        result->ppa = version_ptr->ppn;
+        result->target_read_ts = &version_ptr->read_ts;
+    } else {
+        result->ppa = *ppa_ptr;
+        result->target_read_ts = &ssd->read_ts_table[lpn];
+    }
+
+    return TX_STATUS_OK;
+}
+
+static int ssd_tread_precheck(struct ssd *ssd, NvmeRequest *req) {
+    NvmeTxReadCmd* cmd = (NvmeTxReadCmd*)&req->cmd;
+    int len  = le16_to_cpu(cmd->nlb) + 1;
+    uint64_t lba = le64_to_cpu(cmd->slba);
+    uint64_t read_ts = le64_to_cpu(cmd->timestamp);
+    tx_map_result_enrty *search_result = NULL;
+    uint64_t start_lpn = lba / spp->secs_per_pg;
+    uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
+    uint64_t lpn;
+    int ret;
+
+    /* normal IO read path */
+    for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+        search_result = &ssd->read_map_buffer[lpn - start_lpn];
+        ret = ssd_tread_precheck_one_lpn(ssd, lpn, search_result, read_ts);
+        if (ret == -TX_ERROR_READ_UNCOMMITTED) {
+            return -TX_ERROR_READ_UNCOMMITTED
+        }
+    }
+
+    return TX_STATUS_OK;
+}
+
 static uint64_t ssd_tread(struct ssd *ssd, NvmeRequest *req)
 {
     NvmeTxReadCmd* cmd = (NvmeTxReadCmd*)&req->cmd;
     int len  = le16_to_cpu(cmd->nlb) + 1;
     uint64_t lba = le64_to_cpu(cmd->slba);
+    uint64_t read_ts = le64_to_cpu(cmd->timestamp);
     struct ssdparams *spp = &ssd->sp;
     struct ppa ppa;
+    tx_map_result_enrty *search_result = NULL;
     uint64_t start_lpn = lba / spp->secs_per_pg;
     uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
     uint64_t lpn;
     uint64_t sublat, maxlat = 0;
-
-    femu_debug("read: lba(%d), len(%d)", (int)lba, (int)len);
+    int ret;
 
     if (end_lpn >= spp->tt_pgs) {
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\n", start_lpn, ssd->sp.tt_pgs);
     }
+    
+    /* pre check read uncommitted before data transfer */
+    req->cqe.n.result = cpu_to_le32(TX_STATUS_OK);
+    ret = ssd_tread_precheck(ssd, req);
+    if (ret == -TX_ERROR_READ_UNCOMMITTED) {
+        req->cqe.n.result = cpu_to_le32(TX_ERROR_READ_UNCOMMITTED);
+        return 0;
+    }
 
     /* normal IO read path */
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-        ppa = get_maptbl_ent(ssd, lpn);
+        search_result = &ssd->read_map_buffer[lpn - start_lpn];
+        ppa = search_result->ppa;
+
         if (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa)) {
             //printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
             //printf("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n",
             //ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
             femu_log("read no data lpn");
             continue;
+        }
+
+        if (read_ts > *(search_result->target_read_ts)) {
+            *(search_result->target_read_ts) = read_ts;
         }
 
         struct nand_cmd srd;
@@ -1016,30 +1156,252 @@ static uint64_t ssd_tread(struct ssd *ssd, NvmeRequest *req)
     return maxlat;
 }
 
+static inline struct map_data* get_version_data_from_ppa(struct ssd* ssd, struct ppa* ppa) {
+    return &ssd->map_data_table[ppa->idx.index];
+}
+
+static inline void set_version_index(struct ppa* ppa, uint64_t index) {
+    ppa->ppa = 0;
+    ppa->idx.isIndex = PPA_IS_INDEX_FLAG;
+    ppa->idx.index = index;
+}
+
+static inline uint64_t get_map_data_entry_index(struct ssd *ssd, struct map_data *entry) {
+    return (uint64_t)(entry - ssd->map_data_table);
+}
+
+static int ssd_free_map_data_entry(struct ssd *ssd, struct map_data *free_data) {
+    if (free_data->status == TX_MAP_DATA_INVALID) {
+        femu_log("repeat free map data entry");
+        return TX_STATUS_OK;
+    }
+
+    free_data->status = TX_MAP_DATA_INVALID;
+    idx_pool_free(ssd->map_data_idx_pool, (int)get_map_data_entry_index(ssd, free_data));
+
+    return TX_STATUS_OK;
+}
+
+static int ssd_delete_data_version(struct ssd *ssd, struct map_data *delete_version) {
+    if (delete_version == NULL) {
+        femu_log("delete nullptr");
+        return -TX_ERROR_READ_NULL;
+    }
+
+    struct ppa *prev_field = delete_version->prev_field;
+    struct map_data *next_version = NULL;
+
+    if (map_entry_is_index(&delete_version->next)) {
+        next_version = get_version_data_from_ppa(ssd, &delete_version->next);
+        next_version->prev_field = prev_field;
+    }
+
+    *prev_field = delete_version->next;
+
+    return TX_STATUS_OK;
+}
+
+static int ssd_insert_data_version(struct ssd* ssd, uint64_t lpn, struct map_data* new_version, struct map_data** repeat_version) {
+    struct ppa *header_ppa = get_maptbl_ent_pointer(ssd, lpn), *ppa_ptr = NULL;
+    uint64_t new_version_idx = get_map_data_entry_index(ssd, new_version);
+    uint64_t last_read_ts = ssd->read_ts_table[lpn];
+    struct map_data* version_ptr = NULL;
+
+    if (!map_entry_is_index(header_ppa)) {
+        if (new_version->write_ts < last_read_ts) {
+            return -TX_ERROR_ABORT;
+        }
+
+        new_version->next = *header_ppa;
+        set_version_index(header_ppa, new_version_idx);
+        new_version->prev_field = header_ppa;
+        return TX_STATUS_OK;
+    }
+
+    /* insert new version into time descending version list */
+    ppa_ptr = header_ppa;
+    version_ptr = get_version_data_from_ppa(ssd, ppa_ptr);
+    while (new_version->write_ts < version_ptr->write_ts) {
+        ppa_ptr = &version_ptr->next;
+        if (map_entry_is_index(ppa_ptr)) {
+            version_ptr = get_version_data_from_ppa(ssd, ppa_ptr);
+        } else {
+            version_ptr = NULL;
+            break;
+        }
+    }
+
+    /* handle tx repeat write one lpn */
+    if (version_ptr != NULL) {
+        if (new_version->write_ts == version_ptr->write_ts) {
+            *repeat_version = version_ptr;
+            return -TX_ERROR_DATA_REPEAT;
+        }
+
+        last_read_ts = version_ptr->read_ts;
+    }
+
+    if (new_version->write_ts < last_read_ts) {
+        return -TX_ERROR_ABORT;
+    }
+
+    new_version->next = *ppa_ptr;
+    set_version_index(ppa_ptr, new_version_idx);
+    new_version->prev_field = ppa_ptr;
+
+    if (version_ptr != NULL) {
+        version_ptr->prev_field = &new_version->next;
+    }
+    
+    return TX_STATUS_OK;
+}
+
+static size_t should_version_gc(struct ssd* ssd) {
+    size_t used_count = MAX_LENGTH_OF_META_DATA_LIST - idx_pool_available_count(ssd->map_data_idx_pool);
+    size_t threshold_count = (size_t)(MAX_LENGTH_OF_META_DATA_LIST * ssd->old_version_gc_threshold);
+
+    if (used_count > threshold_count) {
+        return used_count - threshold_count;
+    } else {
+        return 0;
+    }
+}
+
+static inline bool is_garbage_version(struct ssd *ssd, struct map_data *map_info) {
+    return map_info->write_ts < ssd->min_ts_active;
+}
+
+static size_t do_version_gc(struct ssd* ssd, size_t need_space) {
+    size_t gc_num = 0;
+    struct map_data *map_info;
+    struct nand_page *page;
+
+    while ((map_info = pqueue_peek(ssd->committed_queue)) != NULL) {
+        if (map_info->status != TX_MAP_DATA_COMMITED) {
+            pqueue_pop(ssd->committed_queue);
+            continue;
+        }
+
+        if (!is_garbage_version(ssd, map_info)) {
+            break;
+        }
+
+        pqueue_pop(ssd->committed_queue);
+        ssd_delete_data_version(ssd, map_info);
+
+        if (!map_entry_is_index(&map_info->next)) {
+            /* update original PPN */
+            mark_page_invalid(ssd, &map_info->next);
+            set_rmap_ent(ssd, INVALID_LPN, &map_info->next);
+
+            *(map_info->prev_field) = map_info->ppn;
+            page = get_pg(ssd, &map_info->ppn);
+            page->status = PG_VALID;
+            set_rmap_ent(ssd, map_info->lpn, &map_info->ppn);
+        } else {
+            femu_log("gc version is not the tail of version list");
+        }
+
+        ssd_free_map_data_entry(ssd, map_info);
+        ++gc_num;
+        if (gc_num >= need_space) {
+            break;
+        }
+    }
+
+    return gc_num;
+}
+
+static int64_t ssd_twrite_one_lpn(struct ssd *ssd, uint32_t txid, uint64_t lpn, int64_t stime) {
+    struct ssdparams *spp = &ssd->sp;
+    struct ppa new_ppa;
+    tx_table_entry* tx_meta_data = &ssd->tx_table[txid];
+    map_data *map_info = NULL, *repeat_version = NULL;
+    int ret, alloc_idx;
+    uint64_t curlat = 0;
+
+    if (tx_meta_data->lpn_count >= MAX_LPN_PER_TX) {
+        femu_log("too much lpn for one tx");
+        return -TX_ERROR_NO_BUF;
+    }
+
+    /* get new phy page*/
+    new_ppa = get_new_page(ssd);
+    /* alloc a map data for lpn */
+    alloc_idx = idx_pool_alloc(ssd->map_data_idx_pool);
+    if (alloc_idx < 0) {
+        femu_log("alloc map data entry failed");
+        return -TX_ERROR_NO_BUF;
+    }
+
+    map_info = ssd->map_data_table[alloc_idx];
+    tx_meta_data->map_data_index_array[tx_meta_data->lpn_count] = alloc_idx;
+
+    map_info->lpn = lpn;
+    map_info->ppn = new_ppa;
+    map_info->status = TX_MAP_DATA_UNCOMMITTED;
+    map_info->write_ts = tx_meta_data->tx_timestamp;
+    map_info->read_ts = 0;
+
+    ret = ssd_insert_data_version(ssd, lpn, map_info, &repeat_version);
+    if (ret == TX_STATUS_OK) {
+        mark_page_uncommitted(ssd, &new_ppa, alloc_idx);
+    } else if (ret == -TX_ERROR_ABORT) {
+        /* Past writes overwrite future reads */
+        map_info->status = TX_MAP_DATA_INVALID;
+        idx_pool_free(ssd->map_data_idx_pool, alloc_idx);
+        return -TX_ERROR_ABORT;
+    } else if (ret == -TX_ERROR_DATA_REPEAT) {
+        /* free the new allocated map data enrty and update info into old entry */
+        map_info->status = TX_MAP_DATA_INVALID;
+        idx_pool_free(ssd->map_data_idx_pool, alloc_idx);
+
+        mark_page_invalid(ssd, &(repeat_version->ppn));
+        repeat_version->ppn = new_ppa;
+        mark_page_uncommitted(ssd, &new_ppa, (uint32_t)get_map_data_entry_index(ssd, repeat_version));
+        tx_meta_data->map_data_index_array[tx_meta_data->lpn_count] = INVALID_MAP_DATA_INDEX;
+    } else {
+        femu_log("return invalid value");
+        return -TX_ERROR_ABORT;
+    }
+
+    set_rmap_ent(ssd, lpn, &new_ppa);
+    /* need to advance the write pointer here */
+    tx_meta_data->lpn_count++;
+    ssd_advance_write_pointer(ssd);
+
+    struct nand_cmd swr;
+    swr.type = USER_IO;
+    swr.cmd = NAND_WRITE;
+    swr.stime = stime;
+    /* get latency statistics */
+    curlat = ssd_advance_status(ssd, &new_ppa, &swr);
+
+    return (int64_t)curlat;
+}
+
 static uint64_t ssd_twrite(struct ssd *ssd, NvmeRequest *req) {
     struct ssdparams *spp = &ssd->sp;
     NvmeTxWriteCmd* cmd = (NvmeTxWriteCmd*)&req->cmd;
     uint32_t txid = le32_to_cpu(cmd->txid);
-    uint32_t seqid = le32_to_cpu(cmd->seqid);
     int len  = le16_to_cpu(cmd->nlb) + 1;
     uint64_t lba = le64_to_cpu(cmd->slba);
     uint64_t start_lpn = lba / spp->secs_per_pg;
     uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
-    struct ppa ppa;
     uint64_t lpn;
+    int64_t ret;
     uint64_t curlat = 0, maxlat = 0;
-    tx_table_entry* tx_meta_data = NULL;
-    map_data* map_info = NULL;
+    size_t need_space, gc_space;
     int r;
 
     femu_debug("twrite with txid: %u", (unsigned)txid);
 
+    req->cqe.n.result = cpu_to_le32(TX_STATUS_OK);
     if (!(txid < MAX_TX_NUM && entry_in_use(&ssd->tx_table[txid]))) {
         femu_log("write command carry invalid txid");
         return 0;
     }
 
-    tx_meta_data = &ssd->tx_table[txid];
     if (tx_meta_data->status != TX_INIT) {
         femu_log("target tx is already committed or abort");
         return 0;
@@ -1057,48 +1419,35 @@ static uint64_t ssd_twrite(struct ssd *ssd, NvmeRequest *req) {
             break;
     }
 
+    ssd->min_ts_active = le64_to_cpu(cmd->minTsActive);
+    need_space = should_version_gc(ssd);
+    if (need_space > 0) {
+        gc_space = do_version_gc(ssd, need_space);
+        if (gc_space < need_space) {
+            femu_log("version gc free space lower");
+        }
+    }
+
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
-        if (tx_meta_data->lpn_count >= MAX_LPN_PER_TX) {
-            femu_log("too much lpn for one tx");
+        ret = ssd_twrite_one_lpn(ssd, txid, lpn, req->stime);
+        if (ret < 0) {
+            __ssd_abort(ssd, txid);
+            req->cqe.n.result = cpu_to_le32(TX_ERROR_ABORT);
             break;
         }
-        /* get new phy page*/
-        ppa = get_new_page(ssd);
-        /* update map info to tx table */
-        map_info = &tx_meta_data->map_data_array[tx_meta_data->lpn_count];
-        map_info->lpn = lpn;
-        map_info->ppn = ppa;
-        map_info->seq_id = seqid;
-
-        /*mark page uncommitted & update rmap table, and update map table when commit */
-        mark_page_uncommitted(ssd, &ppa, txid, tx_meta_data->lpn_count);
-        set_rmap_ent(ssd, lpn, &ppa);
         
-        /* need to advance the write pointer here */
-        tx_meta_data->lpn_count++;
-        ssd_advance_write_pointer(ssd);
-
-        struct nand_cmd swr;
-        swr.type = USER_IO;
-        swr.cmd = NAND_WRITE;
-        swr.stime = req->stime;
-        /* get latency statistics */
-        curlat = ssd_advance_status(ssd, &ppa, &swr);
+        curlat = (uint64_t)ret;
         maxlat = (curlat > maxlat) ? curlat : maxlat;
     }
 
     return maxlat;
 }
 
-static inline int map_data_cmp(const void* m1, const void* m2) {
-    return (int)(((struct map_data*)m1)->seq_id) - (int)(((struct map_data*)m2)->seq_id);
-}
-
 static uint64_t __ssd_commit(struct ssd *ssd, uint32_t txid) {
     tx_table_entry* tx_meta_data = NULL;
     map_data* map_info = NULL;
-    uint64_t lpn;
-    struct ppa ppn, old_ppn;
+    uint32_t map_data_index;
+    struct ppa ppn;
     struct nand_page* page;
     int ret;
 
@@ -1116,27 +1465,21 @@ static uint64_t __ssd_commit(struct ssd *ssd, uint32_t txid) {
     }
     tx_meta_data->status = TX_COMMIT;
 
-    /* need sort map data by seqid to ensure data update order */
-    memcpy((void*)ssd->temp_sort_buffer, (void*)tx_meta_data->map_data_array, 
-            tx_meta_data->lpn_count * sizeof(struct map_data));
-    qsort((void*)ssd->temp_sort_buffer, tx_meta_data->lpn_count, sizeof(struct map_data), map_data_cmp);
-
     for (int i = 0; i < tx_meta_data->lpn_count; i++) {
-        map_info = &ssd->temp_sort_buffer[i];
-        lpn = map_info->lpn;
-        ppn = map_info->ppn;
-        old_ppn = get_maptbl_ent(ssd, lpn);
-
-        /* mark old ppn invalid */
-        if (mapped_ppa(&old_ppn)) {
-            mark_page_invalid(ssd, &old_ppn);
-            set_rmap_ent(ssd, INVALID_LPN, &old_ppn);
+        map_data_index = tx_meta_data->map_data_index_array[i];
+        if (map_data_index == INVALID_MAP_DATA_INDEX) {
+            /* skip repeat LPN */
+            continue;
         }
 
-        /* page status uncommitted --> valid */
+        map_info = &ssd->map_data_table[map_data_index];
+        map_info->status = TX_MAP_DATA_COMMITED;
+        pqueue_insert(ssd->committed_queue, map_info);
+        
+        /* page status uncommitted --> old version */
+        ppn = map_info->ppn;
         page = get_pg(ssd, &ppn);
-        page->status = PG_VALID;
-        set_maptbl_ent(ssd, lpn, &ppn);
+        page->status = PG_OLD_VERSION;
     }
 
     set_entry_unused(tx_meta_data);
@@ -1158,6 +1501,8 @@ static uint64_t ssd_commit(struct ssd *ssd, NvmeRequest *req) {
 
 static uint64_t __ssd_abort(struct ssd *ssd, uint32_t txid) {
     tx_table_entry* tx_meta_data = NULL;
+    uint32_t map_data_index;
+    struct map_data *map_info;
     struct ppa ppn;
     int ret;
 
@@ -1174,9 +1519,16 @@ static uint64_t __ssd_abort(struct ssd *ssd, uint32_t txid) {
     tx_meta_data->status = TX_ABORT;
 
     for (int i = 0; i < tx_meta_data->lpn_count; i++) {
-        ppn = tx_meta_data->map_data_array[i].ppn;
+        map_data_index = tx_meta_data->map_data_index_array[i];
+        if (map_data_index == INVALID_MAP_DATA_INDEX) {
+            continue;
+        }
 
-        /* mark allocated page invalid */
+        map_info = &ssd->map_data_table[map_data_index];
+        ppn = map_info->ppn;
+
+        /* delete version from list and mark page invalid */
+        ssd_delete_data_version(ssd, map_info);
         mark_page_invalid(ssd, &ppn);
         set_rmap_ent(ssd, INVALID_LPN, &ppn);
     }
@@ -1205,6 +1557,7 @@ static void *ftl_thread(void *arg)
     NvmeRequest *req = NULL;
     uint64_t lat = 0;
     int rc;
+    size_t need_space;
     int i;
 
     while (!*(ssd->dataplane_started_ptr)) {
@@ -1268,6 +1621,11 @@ static void *ftl_thread(void *arg)
             /* clean one line if needed (in the background) */
             if (should_gc(ssd)) {
                 do_gc(ssd, false);
+            }
+
+            need_space = should_version_gc(ssd);
+            if (need_space > 0) {
+                do_version_gc(ssd, need_space);
             }
         }
 

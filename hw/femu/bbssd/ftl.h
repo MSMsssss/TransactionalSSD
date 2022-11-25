@@ -8,10 +8,14 @@
 #define INVALID_LPN     (~(0ULL))
 #define UNMAPPED_PPA    (~(0ULL))
 #define MAX_LPN_PER_TX  (2048)
-#define MAX_TX_NUM      (2048)
+#define MAX_TX_NUM      (256)
 #define INVALID_TX_ID   (~(0U))
+#define INVALID_MAP_DATA_INDEX (~(0U))
 #define IN_USE_FLAG     (1)
 #define UN_USE_FLAG     (0)
+#define PPA_IS_INDEX_FLAG (1)
+#define MAX_LENGTH_OF_META_DATA_LIST (65536)
+#define INDEX_BITS (32)
 
 #define TX_TIME_OUT_VALUE (3000)    //3000ms
 
@@ -38,7 +42,8 @@ enum {
     PG_FREE = 0,
     PG_INVALID = 1,
     PG_VALID = 2,
-    PG_UNCOMMITTED = 3
+    PG_UNCOMMITTED = 3,
+    PG_OLD_VERSION = 4,
 };
 
 enum {
@@ -59,6 +64,24 @@ enum {
     TX_ABORT = 2
 };
 
+enum {
+    TX_MAP_DATA_INVALID = 0,
+    TX_MAP_DATA_UNCOMMITTED = 1,
+    TX_MAP_DATA_COMMITED = 2,
+};
+
+/* error code is negative value and status code is positive value */
+enum {
+    TX_ERROR_ABORT = 1,
+    TX_ERROR_NO_BUF = 2,
+    TX_ERROR_DATA_REPEAT = 3,
+    TX_ERROR_READ_UNCOMMITTED = 4,
+    TX_ERROR_READ_NULL = 5,
+};
+
+enum {
+    TX_STATUS_OK = 0,
+};
 
 #define BLK_BITS    (16)
 #define PG_BITS     (16)
@@ -77,9 +100,15 @@ struct ppa {
             uint64_t pl  : PL_BITS;
             uint64_t lun : LUN_BITS;
             uint64_t ch  : CH_BITS;
-            uint64_t rsv : 1;
+            uint64_t isIndex : 1;
         } g;
 
+        struct {
+            uint64_t index : INDEX_BITS;
+            uint64_t rsv   : 31;
+            uint64_t isIndex : 1;
+        } idx;
+        
         uint64_t ppa;
     };
 };
@@ -90,8 +119,7 @@ struct nand_page {
     nand_sec_status_t *sec;
     int nsecs;
     int status;
-    int txid;   // It can be ignore if status is not UNCOMMITTED
-    int map_index;  //  It can be ignore if status is not UNCOMMITTED
+    uint32_t map_data_index;   // It can be ignore if status is not UNCOMMITTED or OLD_VERSION
 };
 
 struct nand_block {
@@ -212,35 +240,54 @@ struct nand_cmd {
 };
 
 typedef struct map_data {
-    uint32_t seq_id; // seq id mark the bio's order in tx
+    uint16_t status;    // committed, uncommitted, invalid
+    uint64_t read_ts;   // last read ts
+    uint64_t write_ts;  // this version create ts
+
+    struct ppa next;
+    struct ppa *prev_field;
+
     uint64_t lpn;    // logic page 4K
     struct ppa ppn;  // phy page
+    size_t pos; // used by pq
 } map_data;
 
 /* transcation meta data entry */
 typedef struct tx_table_entry {
     int64_t start_time; // this entry alloc time, free when timeout
+    uint64_t tx_timestamp;
     uint32_t in_used;
     int32_t tx_id;
     int32_t status;
-    map_data map_data_array[MAX_LPN_PER_TX];
+    uint32_t map_data_index_array[MAX_LPN_PER_TX];
     int32_t lpn_count;   
 } tx_table_entry;
+
+typedef struct tx_map_result_enrty {
+    struct ppa ppa;
+    uint64_t *target_read_ts;
+} tx_map_result_enrty;
 
 struct ssd {
     char *ssdname;
     struct ssdparams sp;
     struct ssd_channel *ch;
     struct ppa *maptbl; /* page level mapping table */
+    uint64_t* read_ts_table;
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
     struct write_pointer wp;
     struct line_mgmt lm;
 
     /* tx module data */
     tx_table_entry* tx_table;
+    map_data* map_data_table;
     idx_pool* tx_idx_pool;
-    map_data* temp_sort_buffer;
+    idx_pool* map_data_idx_pool;
     int64_t check_tx_timeout_timer;
+    uint64_t min_ts_active;
+    tx_map_result_enrty *read_map_buffer;
+    double old_version_gc_threshold;
+    pqueue_t *committed_queue;
 
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;

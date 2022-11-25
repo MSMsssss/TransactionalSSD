@@ -1182,6 +1182,7 @@ idx_pool* idx_pool_create(int count);
 int idx_pool_alloc(idx_pool* pool);
 int idx_pool_free(idx_pool* pool, int idx);
 int idx_pool_destroy(idx_pool* pool);
+size_t idx_pool_available_count(idx_pool* pool);
 
 #ifdef __cplusplus
 }
