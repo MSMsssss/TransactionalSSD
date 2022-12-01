@@ -422,7 +422,7 @@ static void ssd_init_tx_module(struct ssd* ssd) {
     }
 
     for (int i = 0; i < MAX_LENGTH_OF_META_DATA_LIST; i++) {
-        ssd->map_data_table[i] = TX_MAP_DATA_INVALID;
+        ssd->map_data_table[i].status = TX_MAP_DATA_INVALID;
     }
 }
 
@@ -753,7 +753,7 @@ static uint64_t gc_write_page(struct ssd *ssd, struct ppa *old_ppa)
         /* update tx meta data */
         map_info->ppn = new_ppa;
         mark_page_uncommitted(ssd, &new_ppa, page->map_data_index);
-        get_pg(ssd, new_ppa)->status = page->status;
+        get_pg(ssd, &new_ppa)->status = page->status;
     } else {
         femu_log("run to err branch");
         return 0;
@@ -1064,7 +1064,8 @@ static int ssd_tread_precheck_one_lpn(struct ssd *ssd, uint64_t lpn, tx_map_resu
     }
 
     if (version_ptr != NULL) {
-        if (version_ptr->status != TX_MAP_DATA_COMMITED) {
+        /* read req of one tx can get the data without committed  */
+        if (version_ptr->write_ts != read_ts && version_ptr->status != TX_MAP_DATA_COMMITED) {
             return -TX_ERROR_READ_UNCOMMITTED;
         }
 
@@ -1080,6 +1081,7 @@ static int ssd_tread_precheck_one_lpn(struct ssd *ssd, uint64_t lpn, tx_map_resu
 
 static int ssd_tread_precheck(struct ssd *ssd, NvmeRequest *req) {
     NvmeTxReadCmd* cmd = (NvmeTxReadCmd*)&req->cmd;
+    struct ssdparams *spp = &ssd->sp;
     int len  = le16_to_cpu(cmd->nlb) + 1;
     uint64_t lba = le64_to_cpu(cmd->slba);
     uint64_t read_ts = le64_to_cpu(cmd->timestamp);
@@ -1094,7 +1096,7 @@ static int ssd_tread_precheck(struct ssd *ssd, NvmeRequest *req) {
         search_result = &ssd->read_map_buffer[lpn - start_lpn];
         ret = ssd_tread_precheck_one_lpn(ssd, lpn, search_result, read_ts);
         if (ret == -TX_ERROR_READ_UNCOMMITTED) {
-            return -TX_ERROR_READ_UNCOMMITTED
+            return -TX_ERROR_READ_UNCOMMITTED;
         }
     }
 
@@ -1291,8 +1293,10 @@ static size_t do_version_gc(struct ssd* ssd, size_t need_space) {
 
         if (!map_entry_is_index(&map_info->next)) {
             /* update original PPN */
-            mark_page_invalid(ssd, &map_info->next);
-            set_rmap_ent(ssd, INVALID_LPN, &map_info->next);
+            if (mapped_ppa(&map_info->next)) {
+                mark_page_invalid(ssd, &map_info->next);
+                set_rmap_ent(ssd, INVALID_LPN, &map_info->next);
+            }
 
             *(map_info->prev_field) = map_info->ppn;
             page = get_pg(ssd, &map_info->ppn);
@@ -1313,7 +1317,6 @@ static size_t do_version_gc(struct ssd* ssd, size_t need_space) {
 }
 
 static int64_t ssd_twrite_one_lpn(struct ssd *ssd, uint32_t txid, uint64_t lpn, int64_t stime) {
-    struct ssdparams *spp = &ssd->sp;
     struct ppa new_ppa;
     tx_table_entry* tx_meta_data = &ssd->tx_table[txid];
     map_data *map_info = NULL, *repeat_version = NULL;
@@ -1334,7 +1337,7 @@ static int64_t ssd_twrite_one_lpn(struct ssd *ssd, uint32_t txid, uint64_t lpn, 
         return -TX_ERROR_NO_BUF;
     }
 
-    map_info = ssd->map_data_table[alloc_idx];
+    map_info = &ssd->map_data_table[alloc_idx];
     tx_meta_data->map_data_index_array[tx_meta_data->lpn_count] = alloc_idx;
 
     map_info->lpn = lpn;
@@ -1392,6 +1395,8 @@ static uint64_t ssd_twrite(struct ssd *ssd, NvmeRequest *req) {
     int64_t ret;
     uint64_t curlat = 0, maxlat = 0;
     size_t need_space, gc_space;
+    tx_table_entry *tx_meta_data;
+    uint64_t min_active_ts;
     int r;
 
     femu_debug("twrite with txid: %u", (unsigned)txid);
@@ -1402,6 +1407,7 @@ static uint64_t ssd_twrite(struct ssd *ssd, NvmeRequest *req) {
         return 0;
     }
 
+    tx_meta_data = &ssd->tx_table[txid];
     if (tx_meta_data->status != TX_INIT) {
         femu_log("target tx is already committed or abort");
         return 0;
@@ -1419,7 +1425,11 @@ static uint64_t ssd_twrite(struct ssd *ssd, NvmeRequest *req) {
             break;
     }
 
-    ssd->min_ts_active = le64_to_cpu(cmd->minTsActive);
+    min_active_ts = le64_to_cpu(cmd->minTsActive);
+    if (min_active_ts > ssd->min_ts_active) {
+        ssd->min_ts_active = min_active_ts;
+    }
+
     need_space = should_version_gc(ssd);
     if (need_space > 0) {
         gc_space = do_version_gc(ssd, need_space);

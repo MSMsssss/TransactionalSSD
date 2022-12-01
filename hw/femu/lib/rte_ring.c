@@ -281,7 +281,7 @@ int idx_pool_free(idx_pool* pool, int idx) {
 }
 
 size_t idx_pool_available_count(idx_pool* pool) {
-	return femu_ring_count(&pool->idx_ring);
+	return femu_ring_count(pool->idx_ring);
 }
 
 int idx_pool_destroy(idx_pool* pool) {
