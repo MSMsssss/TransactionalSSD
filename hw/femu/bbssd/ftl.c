@@ -1539,6 +1539,7 @@ static uint64_t __ssd_abort(struct ssd *ssd, uint32_t txid) {
 
         /* delete version from list and mark page invalid */
         ssd_delete_data_version(ssd, map_info);
+        ssd_free_map_data_entry(ssd, map_info);
         mark_page_invalid(ssd, &ppn);
         set_rmap_ent(ssd, INVALID_LPN, &ppn);
     }
@@ -1558,6 +1559,22 @@ static uint64_t ssd_abort(struct ssd *ssd, NvmeRequest *req) {
     uint32_t txid = le32_to_cpu(cmd->txid);
 
     return __ssd_abort(ssd, txid);
+}
+
+static uint64_t ssd_reset(struct ssd *ssd, NvmeRequest *req) {
+    /* gc all committed pages */
+    femu_log("reset TxSSD");
+    
+    ssd->min_ts_active = MAX_TIME_STAMP;
+    do_version_gc(ssd, MAX_LENGTH_OF_META_DATA_LIST);
+    ssd->min_ts_active = 0;
+
+    /* reset read ts */
+    for (int i = 0; i < ssd->sp.tt_pgs; i++) {
+        ssd->read_ts_table[i] = 0;
+    }
+
+    return 0;
 }
 
 static void *ftl_thread(void *arg)
@@ -1605,6 +1622,9 @@ static void *ftl_thread(void *arg)
                 break;
             case NVME_CMD_T_COMMIT:
                 lat = ssd_commit(ssd, req);
+                break;
+            case NVME_CMD_T_RESET:
+                lat = ssd_reset(ssd, req);
                 break;
             case NVME_CMD_WRITE:
                 lat = ssd_write(ssd, req);

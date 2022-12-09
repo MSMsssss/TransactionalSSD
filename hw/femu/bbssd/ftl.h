@@ -7,6 +7,7 @@
 #define INVALID_PPA     (~(0ULL))
 #define INVALID_LPN     (~(0ULL))
 #define UNMAPPED_PPA    (~(0ULL))
+#define MAX_TIME_STAMP  (~(0ULL))
 #define MAX_LPN_PER_TX  (2048)
 #define MAX_TX_NUM      (256)
 #define INVALID_TX_ID   (~(0U))

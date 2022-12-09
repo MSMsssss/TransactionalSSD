@@ -341,7 +341,7 @@ enum NvmeIoCommands {
     NVME_CMD_ZONE_MGMT_SEND     = 0x79,
     NVME_CMD_ZONE_MGMT_RECV     = 0x7a,
     NVME_CMD_ZONE_APPEND        = 0x7d,
-    NVME_CMD_T_AREA_SET         = 0x80,
+    NVME_CMD_T_RESET            = 0x80,
     NVME_CMD_T_WRITE            = 0x81,
     NVME_CMD_T_READ             = 0x82,
     NVME_CMD_T_BEGIN            = 0x84,
