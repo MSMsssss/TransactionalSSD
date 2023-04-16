@@ -13,7 +13,7 @@
 #define IN_USE_FLAG     (1)
 #define UN_USE_FLAG     (0)
 
-#define TX_TIME_OUT_VALUE (3000)    //3000ms
+#define TX_TIME_OUT_VALUE (30000)    //3000ms
 
 enum {
     NAND_READ =  0,
