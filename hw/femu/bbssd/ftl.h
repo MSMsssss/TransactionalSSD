@@ -18,7 +18,7 @@
 #define MAX_LENGTH_OF_META_DATA_LIST (65536)
 #define INDEX_BITS (32)
 
-#define TX_TIME_OUT_VALUE (3000)    //3000ms
+#define TX_TIME_OUT_VALUE (30000)    //3000ms
 
 enum {
     NAND_READ =  0,
